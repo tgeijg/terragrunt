@@ -235,34 +235,54 @@ func generateDefaultTemplate(boilerplateDir string) (string, error) {
 	return boilerplateDir, nil
 }
 
-// downloadTemplate - parse URL and download files
-func downloadTemplate(ctx context.Context, opts *options.TerragruntOptions, templateURL string, tempDir string) (string, error) {
-	parsedTemplateURL, err := tf.ToSourceURL(templateURL, tempDir)
+// DownloadTemplate - parse URL, download files, and handle subfolders.
+// Exported for use in other packages and for testing.
+// The `baseDirForResolvingURL` parameter is used as the base for resolving `templateURL` if it's a local path.
+func DownloadTemplate(ctx context.Context, opts *options.TerragruntOptions, templateURL string, baseDirForResolvingURL string) (string, error) {
+	// First, resolve and rewrite the templateURL (e.g., to add ?ref=tag)
+	parsedTemplateURL, err := tf.ToSourceURL(templateURL, baseDirForResolvingURL)
 	if err != nil {
 		return "", errors.New(err)
 	}
-
 	parsedTemplateURL, err = rewriteTemplateURL(ctx, opts, parsedTemplateURL)
 	if err != nil {
 		return "", errors.New(err)
 	}
-	// regenerate template url with all changes
-	templateURL = parsedTemplateURL.String()
+	finalTemplateURLForGetter := parsedTemplateURL.String() // This URL is used for logging and potentially by getter
 
-	// prepare temporary directory for template
-	templateDir, err := os.MkdirTemp("", "template")
+	// Split the original (or processed) URL to get the base repo URL and any subfolder.
+	// It's important to use a URL that accurately reflects the user's intent regarding subfolders.
+	// tf.SplitSourceURL is designed to handle query strings like ?ref=, so finalTemplateURLForGetter is suitable.
+	baseURLForDownload, subFolder := tf.SplitSourceURL(finalTemplateURLForGetter)
+
+	// Create a temporary directory where the entire repository will be downloaded.
+	repoDownloadDir, err := os.MkdirTemp("", "tg-template-repo-")
 	if err != nil {
 		return "", errors.New(err)
 	}
 
-	// downloading templateURL
-	opts.Logger.Infof("Using template from %s", templateURL)
-
-	if _, err := getter.GetAny(ctx, templateDir, templateURL); err != nil {
+	opts.Logger.Infof("Downloading template from %s into %s", baseURLForDownload, repoDownloadDir)
+	if _, err := getter.GetAny(ctx, repoDownloadDir, baseURLForDownload); err != nil {
+		os.RemoveAll(repoDownloadDir) // Clean up on failure
 		return "", errors.New(err)
 	}
 
-	return templateDir, nil
+	// The path initially points to the root of the downloaded repo.
+	resultingPath := repoDownloadDir
+
+	// If a subfolder was specified, adjust the path to point to the subfolder.
+	if subFolder != "" {
+		resultingPath = filepath.Join(repoDownloadDir, subFolder)
+		// Verify that the subfolder exists.
+		if _, err := os.Stat(resultingPath); os.IsNotExist(err) {
+			os.RemoveAll(repoDownloadDir) // Clean up: repo was downloaded but subfolder not found
+			return "", errors.Errorf("subfolder \"//%s\" not found in downloaded template from %s", subFolder, templateURL)
+		}
+	}
+
+	// At this point, resultingPath is either the root of the downloaded repo or the specified subfolder.
+	// No further os.Stat is needed here as previous checks cover it.
+	return resultingPath, nil
 }
 
 // prepareBoilerplateFiles - prepare boilerplate files from provided template, tf module, or (custom) default template
@@ -272,7 +292,7 @@ func prepareBoilerplateFiles(ctx context.Context, opts *options.TerragruntOption
 	// process template url if it was passed. This overrides the .boilerplate folder in the OpenTofu/Terraform module
 	if templateURL != "" {
 		// process template url if it was passed
-		tempTemplateDir, err := downloadTemplate(ctx, opts, templateURL, tempDir)
+		tempTemplateDir, err := DownloadTemplate(ctx, opts, templateURL, tempDir) // Updated call
 		if err != nil {
 			return "", errors.New(err)
 		}
@@ -290,7 +310,7 @@ func prepareBoilerplateFiles(ctx context.Context, opts *options.TerragruntOption
 		// use defaultTemplateURL if defined in config, otherwise use basic default template
 		if config != nil && config.DefaultTemplate != "" {
 			// process template url if available
-			tempTemplateDir, err := downloadTemplate(ctx, opts, config.DefaultTemplate, tempDir)
+			tempTemplateDir, err := DownloadTemplate(ctx, opts, config.DefaultTemplate, tempDir) // Updated call
 			if err != nil {
 				return "", errors.New(err)
 			}
